@@ -4,6 +4,7 @@
 (define-constant ERR-GOAL-NOT-FOUND (err u103))
 (define-constant ERR-GOAL-NOT-MET (err u104))
 (define-constant ERR-DEADLINE-PASSED (err u105))
+(define-constant ERR-SHARING-DISABLED (err u106))
 
 (define-data-var contract-owner principal tx-sender)
 
@@ -16,12 +17,24 @@
         deadline: uint,
         title: (string-ascii 50),
         created-at: uint,
+        is-shareable: bool,
     }
 )
 
 (define-map user-goals
     { user: principal }
     { goals: (list 10 uint) }
+)
+
+(define-map goal-contributors
+    {
+        goal-id: uint,
+        contributor: principal,
+    }
+    {
+        amount-contributed: uint,
+        contribution-count: uint,
+    }
 )
 
 (define-read-only (get-goal (goal-id uint))
@@ -39,6 +52,7 @@
         (title (string-ascii 50))
         (target-amount uint)
         (deadline uint)
+        (is-shareable bool)
     )
     (let (
             (user-goals-data (get-user-goals tx-sender))
@@ -56,6 +70,7 @@
             deadline: deadline,
             title: title,
             created-at: current-burn-block-height,
+            is-shareable: is-shareable,
         })
         (map-set user-goals { user: tx-sender } { goals: (unwrap-panic (as-max-len? (append current-goals goal-id) u10)) })
         (ok goal-id)
@@ -74,11 +89,39 @@
             (new-amount (+ current-amount amount))
         )
         (asserts! (> amount u0) ERR-INVALID-AMOUNT)
-        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
-        (map-set savings-goals { goal-id: goal-id }
-            (merge goal { current-amount: new-amount })
+        (asserts!
+            (or
+                (is-eq tx-sender (get owner goal))
+                (get is-shareable goal)
+            )
+            ERR-SHARING-DISABLED
         )
-        (ok new-amount)
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        (let (
+                (contributor-data (default-to {
+                    amount-contributed: u0,
+                    contribution-count: u0,
+                }
+                    (map-get? goal-contributors {
+                        goal-id: goal-id,
+                        contributor: tx-sender,
+                    })
+                ))
+                (new-contribution-amount (+ (get amount-contributed contributor-data) amount))
+                (new-contribution-count (+ (get contribution-count contributor-data) u1))
+            )
+            (map-set goal-contributors {
+                goal-id: goal-id,
+                contributor: tx-sender,
+            } {
+                amount-contributed: new-contribution-amount,
+                contribution-count: new-contribution-count,
+            })
+            (map-set savings-goals { goal-id: goal-id }
+                (merge goal { current-amount: new-amount })
+            )
+            (ok new-amount)
+        )
     )
 )
 
@@ -132,6 +175,31 @@
             is-complete: (>= (get current-amount goal) (get target-amount goal)),
         })
         (err ERR-GOAL-NOT-FOUND)
+    )
+)
+
+(define-read-only (get-contributor-stats
+        (goal-id uint)
+        (contributor principal)
+    )
+    (default-to {
+        amount-contributed: u0,
+        contribution-count: u0,
+    }
+        (map-get? goal-contributors {
+            goal-id: goal-id,
+            contributor: contributor,
+        })
+    )
+)
+
+(define-public (toggle-goal-sharing (goal-id uint))
+    (let ((goal (unwrap! (map-get? savings-goals { goal-id: goal-id }) ERR-GOAL-NOT-FOUND)))
+        (asserts! (is-eq tx-sender (get owner goal)) ERR-UNAUTHORIZED)
+        (map-set savings-goals { goal-id: goal-id }
+            (merge goal { is-shareable: (not (get is-shareable goal)) })
+        )
+        (ok (not (get is-shareable goal)))
     )
 )
 
