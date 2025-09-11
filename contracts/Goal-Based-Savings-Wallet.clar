@@ -5,6 +5,9 @@
 (define-constant ERR-GOAL-NOT-MET (err u104))
 (define-constant ERR-DEADLINE-PASSED (err u105))
 (define-constant ERR-SHARING-DISABLED (err u106))
+(define-constant ERR-RECURRING-NOT-FOUND (err u107))
+(define-constant ERR-RECURRING-LIMIT-REACHED (err u108))
+(define-constant ERR-RECURRING-TOO-EARLY (err u109))
 
 (define-data-var contract-owner principal tx-sender)
 
@@ -34,6 +37,21 @@
     {
         amount-contributed: uint,
         contribution-count: uint,
+    }
+)
+
+(define-map recurring-deposits
+    {
+        goal-id: uint,
+        user: principal,
+    }
+    {
+        deposit-amount: uint,
+        interval-blocks: uint,
+        last-deposit-block: uint,
+        max-deposits: uint,
+        deposits-made: uint,
+        is-active: bool,
     }
 )
 
@@ -208,5 +226,174 @@
         (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-UNAUTHORIZED)
         (var-set contract-owner new-owner)
         (ok true)
+    )
+)
+
+(define-public (setup-recurring-deposit
+        (goal-id uint)
+        (deposit-amount uint)
+        (interval-blocks uint)
+        (max-deposits uint)
+    )
+    (let (
+            (goal (unwrap! (map-get? savings-goals { goal-id: goal-id })
+                ERR-GOAL-NOT-FOUND
+            ))
+            (current-block burn-block-height)
+        )
+        (asserts! (is-eq tx-sender (get owner goal)) ERR-UNAUTHORIZED)
+        (asserts! (> deposit-amount u0) ERR-INVALID-AMOUNT)
+        (asserts! (> interval-blocks u0) ERR-INVALID-AMOUNT)
+        (asserts! (> max-deposits u0) ERR-INVALID-AMOUNT)
+        (map-set recurring-deposits {
+            goal-id: goal-id,
+            user: tx-sender,
+        } {
+            deposit-amount: deposit-amount,
+            interval-blocks: interval-blocks,
+            last-deposit-block: current-block,
+            max-deposits: max-deposits,
+            deposits-made: u0,
+            is-active: true,
+        })
+        (ok true)
+    )
+)
+
+(define-public (execute-recurring-deposit (goal-id uint))
+    (let (
+            (recurring-data (unwrap!
+                (map-get? recurring-deposits {
+                    goal-id: goal-id,
+                    user: tx-sender,
+                })
+                ERR-RECURRING-NOT-FOUND
+            ))
+            (goal (unwrap! (map-get? savings-goals { goal-id: goal-id })
+                ERR-GOAL-NOT-FOUND
+            ))
+            (current-block burn-block-height)
+            (next-deposit-block (+ (get last-deposit-block recurring-data)
+                (get interval-blocks recurring-data)
+            ))
+        )
+        (asserts! (get is-active recurring-data) ERR-RECURRING-NOT-FOUND)
+        (asserts! (>= current-block next-deposit-block) ERR-RECURRING-TOO-EARLY)
+        (asserts!
+            (< (get deposits-made recurring-data)
+                (get max-deposits recurring-data)
+            )
+            ERR-RECURRING-LIMIT-REACHED
+        )
+        (asserts! (is-eq tx-sender (get owner goal)) ERR-UNAUTHORIZED)
+        (try! (stx-transfer? (get deposit-amount recurring-data) tx-sender
+            (as-contract tx-sender)
+        ))
+        (let (
+                (current-amount (get current-amount goal))
+                (new-amount (+ current-amount (get deposit-amount recurring-data)))
+                (new-deposits-made (+ (get deposits-made recurring-data) u1))
+                (contributor-data (default-to {
+                    amount-contributed: u0,
+                    contribution-count: u0,
+                }
+                    (map-get? goal-contributors {
+                        goal-id: goal-id,
+                        contributor: tx-sender,
+                    })
+                ))
+                (new-contribution-amount (+ (get amount-contributed contributor-data)
+                    (get deposit-amount recurring-data)
+                ))
+                (new-contribution-count (+ (get contribution-count contributor-data) u1))
+            )
+            (map-set goal-contributors {
+                goal-id: goal-id,
+                contributor: tx-sender,
+            } {
+                amount-contributed: new-contribution-amount,
+                contribution-count: new-contribution-count,
+            })
+            (map-set savings-goals { goal-id: goal-id }
+                (merge goal { current-amount: new-amount })
+            )
+            (map-set recurring-deposits {
+                goal-id: goal-id,
+                user: tx-sender,
+            }
+                (merge recurring-data {
+                    last-deposit-block: current-block,
+                    deposits-made: new-deposits-made,
+                    is-active: (< new-deposits-made (get max-deposits recurring-data)),
+                })
+            )
+            (ok new-amount)
+        )
+    )
+)
+
+(define-public (cancel-recurring-deposit (goal-id uint))
+    (let (
+            (recurring-data (unwrap!
+                (map-get? recurring-deposits {
+                    goal-id: goal-id,
+                    user: tx-sender,
+                })
+                ERR-RECURRING-NOT-FOUND
+            ))
+            (goal (unwrap! (map-get? savings-goals { goal-id: goal-id })
+                ERR-GOAL-NOT-FOUND
+            ))
+        )
+        (asserts! (is-eq tx-sender (get owner goal)) ERR-UNAUTHORIZED)
+        (map-set recurring-deposits {
+            goal-id: goal-id,
+            user: tx-sender,
+        }
+            (merge recurring-data { is-active: false })
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-recurring-deposit
+        (goal-id uint)
+        (user principal)
+    )
+    (map-get? recurring-deposits {
+        goal-id: goal-id,
+        user: user,
+    })
+)
+
+(define-read-only (can-execute-recurring-deposit
+        (goal-id uint)
+        (user principal)
+    )
+    (match (map-get? recurring-deposits {
+        goal-id: goal-id,
+        user: user,
+    })
+        recurring-data (let (
+                (current-block burn-block-height)
+                (next-deposit-block (+ (get last-deposit-block recurring-data)
+                    (get interval-blocks recurring-data)
+                ))
+            )
+            (ok {
+                can-execute: (and
+                    (get is-active recurring-data)
+                    (>= current-block next-deposit-block)
+                    (< (get deposits-made recurring-data)
+                        (get max-deposits recurring-data)
+                    )
+                ),
+                next-deposit-block: next-deposit-block,
+                deposits-remaining: (- (get max-deposits recurring-data)
+                    (get deposits-made recurring-data)
+                ),
+            })
+        )
+        (err ERR-RECURRING-NOT-FOUND)
     )
 )
