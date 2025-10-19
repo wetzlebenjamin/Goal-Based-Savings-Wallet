@@ -8,6 +8,10 @@
 (define-constant ERR-RECURRING-NOT-FOUND (err u107))
 (define-constant ERR-RECURRING-LIMIT-REACHED (err u108))
 (define-constant ERR-RECURRING-TOO-EARLY (err u109))
+(define-constant ERR-MILESTONE-NOT-FOUND (err u110))
+(define-constant ERR-MILESTONE-LIMIT-REACHED (err u111))
+(define-constant ERR-MILESTONE-ALREADY-ACHIEVED (err u112))
+(define-constant ERR-MILESTONE-AMOUNT-INVALID (err u113))
 
 (define-data-var contract-owner principal tx-sender)
 
@@ -53,6 +57,26 @@
         deposits-made: uint,
         is-active: bool,
     }
+)
+
+;; Milestone tracking maps
+(define-map goal-milestones
+    {
+        goal-id: uint,
+        milestone-id: uint,
+    }
+    {
+        target-amount: uint,
+        description: (string-ascii 100),
+        is-achieved: bool,
+        achieved-at: (optional uint),
+        created-at: uint,
+    }
+)
+
+(define-map milestone-counters
+    { goal-id: uint }
+    { count: uint }
 )
 
 (define-read-only (get-goal (goal-id uint))
@@ -138,6 +162,8 @@
             (map-set savings-goals { goal-id: goal-id }
                 (merge goal { current-amount: new-amount })
             )
+            ;; Check and update milestones after deposit
+            (check-and-update-milestones goal-id new-amount)
             (ok new-amount)
         )
     )
@@ -327,6 +353,8 @@
                     is-active: (< new-deposits-made (get max-deposits recurring-data)),
                 })
             )
+            ;; Check and update milestones after recurring deposit
+            (check-and-update-milestones goal-id new-amount)
             (ok new-amount)
         )
     )
@@ -395,5 +423,246 @@
             })
         )
         (err ERR-RECURRING-NOT-FOUND)
+    )
+)
+
+;; ======================================
+;; MILESTONE TRACKER FUNCTIONS
+;; ======================================
+
+;; Add milestone to a savings goal
+(define-public (add-milestone
+        (goal-id uint)
+        (target-amount uint)
+        (description (string-ascii 100))
+    )
+    (let (
+            (goal (unwrap! (map-get? savings-goals { goal-id: goal-id })
+                ERR-GOAL-NOT-FOUND
+            ))
+            (milestone-counter (default-to { count: u0 }
+                (map-get? milestone-counters { goal-id: goal-id })
+            ))
+            (milestone-id (+ (get count milestone-counter) u1))
+            (current-block burn-block-height)
+        )
+        ;; Authorization check
+        (asserts! (is-eq tx-sender (get owner goal)) ERR-UNAUTHORIZED)
+        
+        ;; Validation checks
+        (asserts! (> target-amount u0) ERR-MILESTONE-AMOUNT-INVALID)
+        (asserts! (<= target-amount (get target-amount goal)) ERR-MILESTONE-AMOUNT-INVALID)
+        (asserts! (< (get count milestone-counter) u10) ERR-MILESTONE-LIMIT-REACHED)
+        
+        ;; Create milestone
+        (map-set goal-milestones {
+            goal-id: goal-id,
+            milestone-id: milestone-id,
+        } {
+            target-amount: target-amount,
+            description: description,
+            is-achieved: false,
+            achieved-at: none,
+            created-at: current-block,
+        })
+        
+        ;; Update counter
+        (map-set milestone-counters { goal-id: goal-id }
+            { count: milestone-id }
+        )
+        
+        (ok milestone-id)
+    )
+)
+
+;; Update milestone achievement status (automatically called when deposits are made)
+(define-private (check-and-update-milestones (goal-id uint) (new-amount uint))
+    (let (
+            (milestone-counter (default-to { count: u0 }
+                (map-get? milestone-counters { goal-id: goal-id })
+            ))
+            (current-block burn-block-height)
+        )
+        (fold update-milestone-if-achieved 
+            (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10)
+            { goal-id: goal-id, new-amount: new-amount, max-id: (get count milestone-counter), current-block: current-block }
+        )
+    )
+)
+
+;; Helper function to update milestone achievement
+(define-private (update-milestone-if-achieved 
+        (milestone-id uint) 
+        (data { goal-id: uint, new-amount: uint, max-id: uint, current-block: uint })
+    )
+    (if (and (<= milestone-id (get max-id data))
+             (> milestone-id u0))
+        (match (map-get? goal-milestones {
+            goal-id: (get goal-id data),
+            milestone-id: milestone-id,
+        })
+            milestone (if (and 
+                        (not (get is-achieved milestone))
+                        (>= (get new-amount data) (get target-amount milestone))
+                      )
+                      (begin
+                          (map-set goal-milestones {
+                              goal-id: (get goal-id data),
+                              milestone-id: milestone-id,
+                          }
+                              (merge milestone {
+                                  is-achieved: true,
+                                  achieved-at: (some (get current-block data)),
+                              })
+                          )
+                          data
+                      )
+                      data
+                  )
+            data
+        )
+        data
+    )
+)
+
+;; Get milestone details
+(define-read-only (get-milestone
+        (goal-id uint)
+        (milestone-id uint)
+    )
+    (match (map-get? goal-milestones {
+        goal-id: goal-id,
+        milestone-id: milestone-id,
+    })
+        milestone (ok milestone)
+        (err ERR-MILESTONE-NOT-FOUND)
+    )
+)
+
+;; Get all milestones for a goal
+(define-read-only (get-goal-milestones (goal-id uint))
+    (let (
+            (milestone-counter (default-to { count: u0 }
+                (map-get? milestone-counters { goal-id: goal-id })
+            ))
+        )
+        (ok {
+            total-milestones: (get count milestone-counter),
+            milestones: (fold get-milestone-data
+                (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10)
+                { goal-id: goal-id, max-id: (get count milestone-counter), results: (list) }
+            )
+        })
+    )
+)
+
+;; Helper function to collect milestone data
+(define-private (get-milestone-data 
+        (milestone-id uint)
+        (data { goal-id: uint, max-id: uint, results: (list 10 { milestone-id: uint, target-amount: uint, description: (string-ascii 100), is-achieved: bool, achieved-at: (optional uint) }) })
+    )
+    (if (and (<= milestone-id (get max-id data))
+             (> milestone-id u0))
+        (match (map-get? goal-milestones {
+            goal-id: (get goal-id data),
+            milestone-id: milestone-id,
+        })
+            milestone (merge data {
+                results: (unwrap-panic (as-max-len? 
+                    (append (get results data) {
+                        milestone-id: milestone-id,
+                        target-amount: (get target-amount milestone),
+                        description: (get description milestone),
+                        is-achieved: (get is-achieved milestone),
+                        achieved-at: (get achieved-at milestone),
+                    })
+                    u10
+                ))
+            })
+            data
+        )
+        data
+    )
+)
+
+;; Get milestone progress statistics
+(define-read-only (get-milestone-progress (goal-id uint))
+    (match (map-get? savings-goals { goal-id: goal-id })
+        goal (let (
+                (milestone-counter (default-to { count: u0 }
+                    (map-get? milestone-counters { goal-id: goal-id })
+                ))
+                (current-amount (get current-amount goal))
+                (progress-data (fold count-achieved-milestones
+                    (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10)
+                    { 
+                        goal-id: goal-id, 
+                        max-id: (get count milestone-counter), 
+                        achieved: u0, 
+                        current-amount: current-amount 
+                    }
+                ))
+            )
+            (ok {
+                total-milestones: (get count milestone-counter),
+                achieved-milestones: (get achieved progress-data),
+                completion-percentage: (if (> (get count milestone-counter) u0)
+                    (/ (* (get achieved progress-data) u100) (get count milestone-counter))
+                    u0
+                ),
+            })
+        )
+        (err ERR-GOAL-NOT-FOUND)
+    )
+)
+
+;; Helper function to count achieved milestones
+(define-private (count-achieved-milestones 
+        (milestone-id uint)
+        (data { goal-id: uint, max-id: uint, achieved: uint, current-amount: uint })
+    )
+    (if (and (<= milestone-id (get max-id data))
+             (> milestone-id u0))
+        (match (map-get? goal-milestones {
+            goal-id: (get goal-id data),
+            milestone-id: milestone-id,
+        })
+            milestone (if (get is-achieved milestone)
+                      (merge data { achieved: (+ (get achieved data) u1) })
+                      data
+                  )
+            data
+        )
+        data
+    )
+)
+
+;; Remove milestone (only if not achieved)
+(define-public (remove-milestone
+        (goal-id uint)
+        (milestone-id uint)
+    )
+    (let (
+            (goal (unwrap! (map-get? savings-goals { goal-id: goal-id })
+                ERR-GOAL-NOT-FOUND
+            ))
+            (milestone (unwrap! (map-get? goal-milestones {
+                goal-id: goal-id,
+                milestone-id: milestone-id,
+            }) ERR-MILESTONE-NOT-FOUND))
+        )
+        ;; Authorization check
+        (asserts! (is-eq tx-sender (get owner goal)) ERR-UNAUTHORIZED)
+        
+        ;; Cannot remove achieved milestones
+        (asserts! (not (get is-achieved milestone)) ERR-MILESTONE-ALREADY-ACHIEVED)
+        
+        ;; Remove milestone
+        (map-delete goal-milestones {
+            goal-id: goal-id,
+            milestone-id: milestone-id,
+        })
+        
+        (ok true)
     )
 )
