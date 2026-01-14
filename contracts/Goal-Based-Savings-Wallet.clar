@@ -733,6 +733,69 @@
     )
 )
 
+(define-read-only (get-goal-dashboard (goal-id uint) (viewer principal))
+    (match (map-get? savings-goals { goal-id: goal-id })
+        goal (let (
+                (progress (unwrap-panic (get-goal-progress goal-id)))
+                (milestone-data (unwrap-panic (get-milestone-progress goal-id)))
+                (viewer-contributor (get-contributor-stats goal-id viewer))
+                (owner-recurring (get-recurring-deposit goal-id (get owner goal)))
+                (can-recurring (match owner-recurring
+                    rec-data (unwrap-panic (can-execute-recurring-deposit goal-id (get owner goal)))
+                    { can-execute: false, next-deposit-block: u0, deposits-remaining: u0 }
+                ))
+                (current-block burn-block-height)
+                (time-remaining (if (> (get deadline goal) current-block)
+                    (- (get deadline goal) current-block)
+                    u0
+                ))
+            )
+            (ok {
+                goal-info: {
+                    goal-id: goal-id,
+                    owner: (get owner goal),
+                    title: (get title goal),
+                    target-amount: (get target-amount goal),
+                    current-amount: (get current-amount goal),
+                    deadline: (get deadline goal),
+                    created-at: (get created-at goal),
+                    is-shareable: (get is-shareable goal),
+                },
+                progress: {
+                    percentage: (get percentage progress),
+                    remaining: (get remaining progress),
+                    is-complete: (get is-complete progress),
+                    time-remaining: time-remaining,
+                },
+                milestones: {
+                    total-milestones: (get total-milestones milestone-data),
+                    achieved-milestones: (get achieved-milestones milestone-data),
+                    completion-percentage: (get completion-percentage milestone-data),
+                },
+                viewer-contribution: {
+                    amount-contributed: (get amount-contributed viewer-contributor),
+                    contribution-count: (get contribution-count viewer-contributor),
+                },
+                recurring-deposit: (match owner-recurring
+                    rec-data (some {
+                        deposit-amount: (get deposit-amount rec-data),
+                        interval-blocks: (get interval-blocks rec-data),
+                        last-deposit-block: (get last-deposit-block rec-data),
+                        max-deposits: (get max-deposits rec-data),
+                        deposits-made: (get deposits-made rec-data),
+                        is-active: (get is-active rec-data),
+                        can-execute: (get can-execute can-recurring),
+                        next-deposit-block: (get next-deposit-block can-recurring),
+                        deposits-remaining: (get deposits-remaining can-recurring),
+                    })
+                    none
+                ),
+            })
+        )
+        (err ERR-GOAL-NOT-FOUND)
+    )
+)
+
 (define-private (accumulate-goal-summary
         (goal-id uint)
         (data {
